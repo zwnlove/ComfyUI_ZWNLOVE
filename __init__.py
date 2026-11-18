@@ -274,12 +274,16 @@ class ZWNLOVE_ImageCrop:
     放大算法固定 lanczos，不额外暴露控件，保持面板简单。
     """
 
-    # 断点开关（原生 COMBO，默认「正常模式」）：
-    #   正常模式 -> 纯剪裁直通，什么都不干预，1/2 号可以完全不摆
-    #   断点模式 -> 前端把剪裁图送进 3 号文件下拉、显示出来，然后不递交运行，
-    #               等用户在 3 号上画完遮罩再自己点运行
+    # 模式开关（原生 COMBO，默认「正常模式」）：
+    #   正常模式 -> 纯剪裁直通，靠输出连线把图交给下游，什么都不干预
+    #   加载模式 -> 不走连线：前端把剪裁图写进 input/ 并顶到「加载图像 孤海」的
+    #               文件下拉里，等用户在那画完遮罩再自己点运行
+    # 加载模式下，前端会在组装 prompt 之后把下游节点的「图像输入」这个键删掉，
+    # 所以那根线可以一直连着看着，不用为了跑起来手动删线。
     # 后端 run() 不消费这个值；它只负责被 ComfyUI 渲染成平台原生下拉。
-    MODES = ("正常模式", "断点模式")
+    MODES = ("正常模式", "加载模式")
+    # 旧下拉值，只给没刷新的老工作流用；前端 onConfigure 会翻译成「加载模式」
+    LEGACY_MODES = ("断点模式",)
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -308,7 +312,10 @@ class ZWNLOVE_ImageCrop:
                 # 只扫描 input.required 里带 image_upload 的 COMBO 来生成
                 # 「选择文件上传」按钮，放 optional 不会有任何上传控件；
                 # 按钮由平台追加到所有参数之后，正好紧跟这一行。
-                "图片": (sorted(files), {"image_upload": True}),
+                # 「无」必须排在第一位：文件被清理/挪走后，前端把悬空引用
+                # 收敛成「无」——它是下拉里的合法值，平台校验放行不爆红；
+                # 真正选图时再换成具体文件名。
+                "图片": (["无"] + sorted(files), {"image_upload": True}),
             },
             "optional": {
                 # IMAGE 端子保留但改成可选：接了上游就用上游的图，
@@ -322,6 +329,14 @@ class ZWNLOVE_ImageCrop:
     FUNCTION = "run"
     CATEGORY = "ZWNLOVE/裁剪"
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, **kwargs):
+        # 「图片」控件引用的文件可能已不在 input 目录（清理缓存、挪走图片、
+        # 换机器打开都会造成悬空引用）。默认的 combo 校验会拿
+        # "Value not in list" 卡死整条工作流——哪怕 image 端子已经接了上游、
+        # 根本用不到这张图。这里放开，缺图的后果留给 run() 给一句中文提示。
+        return True
+
     def run(self, image=None, width=512, height=512, x=0, y=0, **kwargs):
         # 没接上游 IMAGE 线时，用本节点原生「图片」控件选中的文件自己加载。
         # 走内置 LoadImage 的同一套解析（EXIF / alpha / 多帧都一致）。
@@ -329,12 +344,19 @@ class ZWNLOVE_ImageCrop:
             name = kwargs.get("图片", "")
             if not name or str(name).strip() in ("", "无"):
                 raise RuntimeError("请先在节点上用「图片」控件选择或上传一张图片")
+            import folder_paths
+            if not folder_paths.exists_annotated_filepath(str(name)):
+                raise RuntimeError(
+                    "「图片」控件引用的文件已不在 input 目录：%s（可能被清理或挪走），"
+                    "请重新选择或上传一张图片" % str(name)
+                )
             from nodes import LoadImage as _LoadImage
             image = _LoadImage().load_image(name)[0]
 
-        # 与内置 ImageCrop 相同的越界处理：起点不许出界，右/下越界靠切片自然截断
-        x = min(int(x), image.shape[2] - 1)
-        y = min(int(y), image.shape[1] - 1)
+        # 与内置 ImageCrop 相同的越界处理：起点不许出界，右/下越界靠切片自然截断。
+        # 负数也兜住：INT 控件虽限 min=0，API 直传时可能绕过前端，负索引会从尾部取图
+        x = max(0, min(int(x), image.shape[2] - 1))
+        y = max(0, min(int(y), image.shape[1] - 1))
         out = image[:, y:y + int(height), x:x + int(width), :]
 
         # 老工作流的 widgets_values 第 5 项是 DOM widget 的空串，可能被前端塞进来；

@@ -143,7 +143,7 @@ function setupPool(node) {
   }
 
   // 每次执行完，用后端返回的真实进度覆盖前端显示
-  api.addEventListener("executed", (event) => {
+  const onExecuted = (event) => {
     const d = (event && event.detail) || {};
     const nid = d.node ?? d.node_id ?? d.nodeId;
     if (String(nid) !== String(node.id)) return;
@@ -162,7 +162,15 @@ function setupPool(node) {
         setStart(nx);
       }
     }
-  });
+  };
+  api.addEventListener("executed", onExecuted);
+  // 这是挂在全局 api 上的监听，节点删掉后不会自动失效，必须手动摘，
+  // 否则闭包一直攥着 node，切工作流/删节点都会累积
+  const origRemoved = node.onRemoved;
+  node.onRemoved = function () {
+    try { api.removeEventListener("executed", onExecuted); } catch (err) {}
+    return origRemoved ? origRemoved.apply(this, arguments) : undefined;
+  };
 
   setTimeout(refresh, 0);
 }
@@ -679,7 +687,13 @@ function setupCropVisual(node) {
     paint();
   };
   if (typeof ResizeObserver !== "undefined") {
-    try { new ResizeObserver(() => relayout(true)).observe(stage); } catch (err) {}
+    // 重复挂载时先掐掉上一个，节点删除时由 onRemoved 统一清理
+    try { node.__zwnCropRO?.disconnect?.(); } catch (err) {}
+    try {
+      const ro = new ResizeObserver(() => relayout(true));
+      ro.observe(stage);
+      node.__zwnCropRO = ro;
+    } catch (err) {}
   }
   const commit = () => {
     if (!imgW || !imgH) return;
@@ -837,18 +851,210 @@ function setupCropVisual(node) {
 // CROP_TESTABLE_END
 
 /* ==================================================================
-   断点开关（已整合进 2 号 ImageCrop，不再有独立的 13 号节点）
-   2 号原生 COMBO「模式」切到「断点模式」时，把 1 号源图按 2 号自己的
-   width/height/x/y/缩放比例 裁好，存进 3 号「加载图像 孤海」自己的
+   模式开关（已整合进 2 号 ImageCrop，不再有独立的 13 号节点）
+   2 号原生 COMBO「模式」切到「加载模式」时，把源图按 2 号自己的
+   width/height/x/y/缩放比例 裁好，存进「加载图像 孤海」自己的
    image 文件下拉，替代「手工上传」这一步。
 
    只写 3 号原生就有的 image widget，不改 3 号任何代码，
    也不依赖我们给 3 号加的「图像输入」端子 —— 别人原版 3 号照样能用。
+   反过来说：加载模式下那根「图像输出 → 图像输入」的线会被本文件在
+   提交 prompt 时摘掉（见文件末尾 LoadModeLinkGuard），所以线可以一直
+   连着，切回正常模式立刻恢复生效，不用手动加线删线。
    参数区全部由后端声明的原生 widget 渲染，这里一行自绘 UI 都没有。
    ================================================================== */
 const ZWN_CROP_TYPES = new Set(["ImageCrop", "ZWNLOVE_ImageCrop"]);
 const ZWN_MODE_NORMAL = "正常模式";
-const ZWN_MODE_BREAK = "断点模式";
+const ZWN_MODE_LOAD = "加载模式";
+// 旧名字（断点模式）。后端没重启前下拉里还是它，读的时候一并认。
+const ZWN_MODE_LEGACY = "断点模式";
+
+// 是不是「加载模式」：新名字、旧名字都算，重启前后都能工作
+function zwnIsLoadMode(modeWidget) {
+  const v = String((modeWidget && modeWidget.value) ?? "");
+  return v === ZWN_MODE_LOAD || v === ZWN_MODE_LEGACY;
+}
+
+// 把模式值收敛到「下拉里真实存在的那一个」。
+// 旧工作流存的是「断点模式」，后端换成「加载模式」后会被 validate_inputs 拦成
+// Value not in list，所以这里翻成当前下拉支持的写法；其它非法值退回正常模式。
+function zwnNormalizeModeValue(modeWidget) {
+  if (!modeWidget) return;
+  const vals = Array.isArray(modeWidget.options?.values) ? modeWidget.options.values : null;
+  const loadLabel = vals
+    ? (vals.includes(ZWN_MODE_LOAD) ? ZWN_MODE_LOAD
+      : (vals.includes(ZWN_MODE_LEGACY) ? ZWN_MODE_LEGACY : null))
+    : ZWN_MODE_LOAD;
+  if (zwnIsLoadMode(modeWidget)) {
+    if (loadLabel && String(modeWidget.value) !== loadLabel) modeWidget.value = loadLabel;
+  } else if (String(modeWidget.value ?? "") !== ZWN_MODE_NORMAL) {
+    modeWidget.value = ZWN_MODE_NORMAL;
+  }
+}
+
+/* 加载模式下把「图像输入」这根线在提交时摘掉 ------------------------------
+   用户不用删线：线留在画布上（看得见、保存得住），只在组装 prompt 时把
+   目标节点的 图像输入 键删掉，后端收到的就是 None → 走文件分支、遮罩正常。
+   同时下游不吃这个输出，裁剪节点自然被剪枝，不会多跑一遍。
+   切回正常模式，线立刻恢复生效。 */
+function zwnStripLoadModeLinks(output) {
+  if (!output || typeof output !== "object") return 0;
+  const graph = app.graph;
+  if (!graph) return 0;
+  const loadIds = new Set();
+  const collect = (list) => {
+    for (const n of list || []) {
+      if (!n || !ZWN_CROP_TYPES.has(n.type)) continue;
+      const w = (n.widgets || []).find((x) => x && x.name === "模式");
+      if (zwnIsLoadMode(w)) loadIds.add(String(n.id));
+    }
+  };
+  collect(graph._nodes);
+  // 子图里的节点也要算：LGraph 的 subgraphs 里各有一份 _nodes
+  for (const sg of graph.subgraphs?.values?.() ?? []) collect(sg?._nodes);
+  if (!loadIds.size) return 0;
+  // 子图内节点的执行 id 形如 "1:2:303"（ExecutableNodeDTO），最后一段才是原始 id
+  const tail = (id) => {
+    const s = String(id ?? "");
+    const i = s.lastIndexOf(":");
+    return i >= 0 ? s.slice(i + 1) : s;
+  };
+  let hit = 0;
+  for (const entry of Object.values(output)) {
+    const ins = entry && entry.inputs;
+    if (!ins) continue;
+    const v = ins["图像输入"];
+    if (!Array.isArray(v)) continue;
+    const src = String(v[0]);
+    if (loadIds.has(src) || (src.includes(":") && loadIds.has(tail(src)))) {
+      delete ins["图像输入"];
+      hit++;
+    }
+  }
+  return hit;
+}
+
+// 「图片」控件引用的文件可能已不在 input 目录（清理缓存、挪走图片、换机器
+// 打开都会造成悬空引用）。平台「缺少媒体输入」扫描会把悬空引用判成缺文件：
+// 节点爆红、点运行弹「Image Crop 缺少所需的媒体文件」，哪怕 image 端子已经
+// 接了上游、根本用不到这张图。这里把悬空引用收敛成「无」——「无」是后端
+// 下拉里的合法选项，平台校验放行不爆红；画布面板对「无」也按未选图处理，
+// 只显示空画布不报错。真跑起来缺图时后端会给一句中文提示。
+function zwnNormalizePictureWidget(node) {
+  const w = (node.widgets || []).find((x) => x && x.name === "图片");
+  if (!w || typeof w.value !== "string") return;
+  const v = w.value;
+  // 值可能带 "文件名 [input]" 这类注解，去掉注解再比对
+  const base = v.replace(/\s*\[[^\]]*\]\s*$/, "").trim();
+  if (!base || base === "无") {
+    // 空值会被平台判成「媒体输入未选择文件」爆红，统一收敛成「无」
+    if (v !== "无") {
+      w.value = "无";
+      const vals = w.options && w.options.values;
+      if (Array.isArray(vals) && !vals.includes("无")) vals.unshift("无");
+    }
+    return;
+  }
+  const vals = Array.isArray(w.options && w.options.values) ? w.options.values : null;
+  // 只有拿不到选项列表（options 还没挂上）才不动它；空数组说明 input 目录
+  // 真的没图了，任何非空值都是悬空引用，照常收敛
+  if (!vals) return;
+  if (vals.includes(v) || vals.includes(base)) return;
+  w.value = "无";
+  if (!vals.includes("无")) vals.unshift("无");
+}
+
+// 载入工作流前的预清理 ----------------------------------------------
+// onConfigure 里的自检有个时机漏洞：新前端把 widgets_values 应用到控件的动作
+// 发生在 onConfigure 之后，而「缺少媒体输入」扫描紧随其后——自检还没来得及
+// 看到旧文件名，扫描已经判了缺文件爆红。所以这里抢在图载入之前把序列化数据
+// 里的悬空「图片」值预处理成「无」，扫描看到的就是合法值，从根上不再报错。
+// 两个入口都挂：beforeConfigureGraph（扩展点，绝大多数加载都经过），
+// 以及 loadGraphData 整体包装（最早的一道，覆盖重启后自动恢复上次工作流）。
+async function zwnSanitizeGraphData(graphData) {
+  if (!graphData || typeof graphData !== "object") return;
+  const lists = [graphData.nodes];
+  const defs = graphData.definitions || {};
+  for (const sg of defs.subgraphs || []) lists.push(sg && sg.nodes);
+  for (const list of lists) {
+    for (const nd of list || []) {
+      if (!nd || !ZWN_CROP_TYPES.has(nd.type)) continue;
+      const wv = nd.widgets_values;
+      if (wv && typeof wv === "object" && !Array.isArray(wv)) {
+        // 新格式：按名字存的对象
+        if (typeof wv["图片"] === "string") {
+          wv["图片"] = await zwnSanitizePictureValue(wv["图片"]);
+        }
+        continue;
+      }
+      if (!Array.isArray(wv)) continue;
+      // 老格式：按位置存。「图片」是最后一个文件名样式的字符串；
+      // 控件顺序 width/height/x/y/缩放比例/比例选择/模式/图片，兜底第 8 个
+      let idx = -1;
+      for (let i = wv.length - 1; i >= 0; i--) {
+        if (typeof wv[i] === "string"
+          && /\.(png|jpe?g|webp|gif|bmp)$/i.test(wv[i].trim())) { idx = i; break; }
+      }
+      if (idx < 0 && wv.length > 7 && typeof wv[7] === "string") idx = 7;
+      if (idx < 0) continue;
+      wv[idx] = await zwnSanitizePictureValue(wv[idx]);
+    }
+  }
+}
+
+app.registerExtension({
+  name: "ZWNLOVE.PicturePreSanitize",
+  async beforeConfigureGraph(graphData) {
+    try { await zwnSanitizeGraphData(graphData); } catch (err) {}
+  },
+  setup() {
+    const install = () => {
+      if (typeof app.loadGraphData !== "function") return false;
+      if (app.__zwnGraphSanitized) return true;
+      const orig = app.loadGraphData;
+      // 最外层的兜底：loadGraphData 是所有加载路径的总入口
+      // （手动打开、重启后恢复上次工作流、切换工作流都走它）
+      app.loadGraphData = async function (graphData, ...rest) {
+        try { await zwnSanitizeGraphData(graphData); } catch (err) {}
+        return orig.call(this, graphData, ...rest);
+      };
+      app.__zwnGraphSanitized = true;
+      return true;
+    };
+    let tries = 0;
+    const tick = () => {
+      if (install()) return;
+      if (++tries < 20) setTimeout(tick, 500);
+    };
+    tick();
+  },
+});
+
+// 悬空「图片」值 -> 「无」：空值、已是「无」直接返回；带注解先剥注解；
+// 文件还在就原样保留，探测不到（404）才收敛成「无」
+async function zwnSanitizePictureValue(v) {
+  const s = String(v ?? "").trim();
+  if (!s || s === "无") return "无";
+  const base = s.replace(/\s*\[[^\]]*\]\s*$/, "").trim();
+  if (!base || base === "无") return "无";
+  try {
+    const ok = await zwnFileExistsOnServer(base);
+    if (ok === false) return "无";
+  } catch (err) {}
+  return v;
+}
+
+// 控件值被前端晚于 onConfigure 应用时的兜底：载入后几个时间点再收敛几轮，
+// 迟到的旧文件名也会被翻成「无」
+function zwnSchedulePictureSweeps(node) {
+  for (const d of [400, 1200, 3000]) {
+    setTimeout(() => {
+      if (node.graph) {
+        try { zwnNormalizePictureWidget(node); } catch (err) {}
+      }
+    }, d);
+  }
+}
 
 app.registerExtension({
   name: "ZWNLOVE.CropBreakpoint",
@@ -863,23 +1069,27 @@ app.registerExtension({
     const attach = function (retry) {
       if (this.__zwnSendAttached) return;
       let ok = false;
+      try { zwnNormalizePictureWidget(this); } catch (err) {}
       try { ok = zwnSetupCropBreakpoint(this); }
       catch (err) { console.warn("[ZWNLOVE] crop breakpoint:", err); }
       if (ok) { this.__zwnSendAttached = true; return; }
       const n = retry || 0;
-      if (n < 3) {
+      // 3 次（1.8s）对慢机器/大工作流偏紧，放宽到 8 次；节点已被删就别再试
+      if (n < 8) {
         const self = this;
-        setTimeout(() => attach.call(self, n + 1), 600);
+        setTimeout(() => { if (self.graph) attach.call(self, n + 1); }, 600);
       }
     };
     proto.onNodeCreated = function () {
       const r = origCreated ? origCreated.apply(this, arguments) : undefined;
       attach.call(this, 0);
+      zwnSchedulePictureSweeps(this);
       return r;
     };
     proto.onConfigure = function () {
       const r = origConf ? origConf.apply(this, arguments) : undefined;
       attach.call(this, 0);
+      zwnSchedulePictureSweeps(this);
       return r;
     };
   },
@@ -1068,26 +1278,25 @@ function zwnSetupCropBreakpoint(node) {
   // 否则用户改宽度会误触发送图。只认名字或认「含断点模式选项」的 COMBO。
   const modeW = ws.find((w) => w && w.name === "模式")
     || ws.find((w) => w && w.type === "combo" && Array.isArray(w.options?.values)
-      && w.options.values.includes(ZWN_MODE_BREAK));
+      && (w.options.values.includes(ZWN_MODE_LOAD) || w.options.values.includes(ZWN_MODE_LEGACY)));
   if (!modeW) return false;
-  // 老工作流按位置回放 widgets_values 时，DOM 占位的空串可能落到本控件，
-  // 递交会被 COMBO 校验拦成 "Value not in list"，这里一律纠正成默认模式
-  if (![ZWN_MODE_NORMAL, ZWN_MODE_BREAK].includes(String(modeW.value))) {
-    modeW.value = ZWN_MODE_NORMAL;
-  }
   // 某些加载时序下 COMBO 会被降级成 text 占位控件，这里恢复成平台原生下拉
   if (modeW.type !== "combo") modeW.type = "combo";
   if (!modeW.options) modeW.options = {};
   if (!Array.isArray(modeW.options.values)) {
-    modeW.options.values = [ZWN_MODE_NORMAL, ZWN_MODE_BREAK];
+    modeW.options.values = [ZWN_MODE_NORMAL, ZWN_MODE_LOAD];
   } else {
     if (!modeW.options.values.includes(ZWN_MODE_NORMAL)) {
       modeW.options.values.unshift(ZWN_MODE_NORMAL);
     }
-    if (!modeW.options.values.includes(ZWN_MODE_BREAK)) {
-      modeW.options.values.push(ZWN_MODE_BREAK);
-    }
+    // 新名字回来之前（后端没重启），下拉里还是旧名字，别硬塞新值
+    const hasAnyLoad = modeW.options.values.some(
+      (v) => v === ZWN_MODE_LOAD || v === ZWN_MODE_LEGACY);
+    if (!hasAnyLoad) modeW.options.values.push(ZWN_MODE_LOAD);
   }
+  // 老工作流回放 widgets_values 时可能塞进空串或旧名字，先收敛一次。
+  // 旧名字「断点模式」要翻译成「加载模式」，不能悄悄退化成正常模式。
+  zwnNormalizeModeValue(modeW);
   const origCb = modeW.callback;
   let last = String(modeW.value ?? "");
   // 加载工作流时会回放 widget 值，不能把「上次保存时停在断点」误当成用户操作
@@ -1104,12 +1313,12 @@ function zwnSetupCropBreakpoint(node) {
       }
     });
   };
-  // 断点模式下，只要 1 号的图或 2 号的参数变了，就自动重送一次
+  // 加载模式下，只要 1 号的图或 2 号的参数变了，就自动重送一次
   const maybeSend = () => {
     if (!node.__zwnArmed) { sig = zwnSendSignature(node); return; }
     // 正在送时什么都不做，也不吞掉这次变化，留到下一轮再比
     if (node.__zwnSending) return;
-    if (String(modeW.value) !== ZWN_MODE_BREAK) {
+    if (!zwnIsLoadMode(modeW)) {
       sig = zwnSendSignature(node);
       return;
     }
@@ -1142,35 +1351,50 @@ function zwnSetupCropBreakpoint(node) {
   };
   watchAll();
   // 兜底：有些路径直接改 widget.value 不调 callback（上传回填、拖框等）。
-  // 只在断点模式开一个轻量轮询，正常模式完全不跑。
+  // 只在加载模式开一个轻量轮询，正常模式完全不跑。
   const arm = () => setTimeout(() => {
     watchAll();   // 工作流载入时 1 号可能比 2 号晚建好，这里再认一次
+    // widgets_values 的回放可能晚于 onConfigure，等它落定后再收敛一次模式值，
+    // 否则旧名字会留在控件里，提交时被 COMBO 校验拦掉
+    zwnNormalizeModeValue(modeW);
+    last = String(modeW.value ?? "");
     node.__zwnArmed = true;
     sig = zwnSendSignature(node);
-    if (String(modeW.value) === ZWN_MODE_BREAK) startPoll();
+    if (zwnIsLoadMode(modeW)) startPoll();
   }, 350);
   const origConf = node.onConfigure;
   node.onConfigure = function () {
     const r = origConf ? origConf.apply(this, arguments) : undefined;
     node.__zwnArmed = false;
-    if (![ZWN_MODE_NORMAL, ZWN_MODE_BREAK].includes(String(modeW.value))) {
-      modeW.value = ZWN_MODE_NORMAL;
-    }
+    zwnNormalizeModeValue(modeW);
     last = String(modeW.value ?? "");
     stopPoll();
     arm();
     return r;
   };
+  // 节点被删/工作流被关掉时必须停掉 500ms 轮询和未触发的 debounce，
+  // 否则定时器会一直空转（原实现没有 onRemoved，属于泄漏）
+  const origRemoved = node.onRemoved;
+  node.onRemoved = function () {
+    stopPoll();
+    if (debounce) { clearTimeout(debounce); debounce = null; }
+    node.__zwnArmed = false;
+    try { node.__zwnCropRO?.disconnect?.(); } catch (err) {}
+    node.__zwnCropRO = null;
+    return origRemoved ? origRemoved.apply(this, arguments) : undefined;
+  };
   arm();
   modeW.callback = function (v) {
     const r = origCb ? origCb.apply(this, arguments) : undefined;
     const cur = typeof v === "string" && v ? v : String(modeW.value ?? "");
-    if (node.__zwnArmed && cur === ZWN_MODE_BREAK && last !== ZWN_MODE_BREAK) {
-      // 手动切进断点：立刻送一次，同时重置基线，免得轮询再送一遍
+    const isLoad = cur === ZWN_MODE_LOAD || cur === ZWN_MODE_LEGACY;
+    const wasLoad = last === ZWN_MODE_LOAD || last === ZWN_MODE_LEGACY;
+    if (node.__zwnArmed && isLoad && !wasLoad) {
+      // 手动切进加载模式：立刻送一次，同时重置基线，免得轮询再送一遍
       sig = zwnSendSignature(node);
       send(false);
       startPoll();
-    } else if (cur !== ZWN_MODE_BREAK) {
+    } else if (!isLoad) {
       stopPoll();
       if (debounce) { clearTimeout(debounce); debounce = null; }
       sig = zwnSendSignature(node);
@@ -1180,4 +1404,172 @@ function zwnSetupCropBreakpoint(node) {
   };
   return true;
 }
+/* 加载模式：提交前把「图像输入」这根线摘掉 ---------------------------------
+   线留在画布上（看得见、存得下），只在 prompt 组装完之后把目标节点的
+   「图像输入」键删掉。后端收到 None → 走文件分支，遮罩照旧从笔刷 alpha 算，
+   不会再出现「全 0 遮罩 → 补成全选 → 被纯色盖满」。
+   下游不吃这个输出，裁剪节点自然被剪枝，不会白跑一遍。
+   切回正常模式，同一个包装立刻放行，线恢复生效 —— 用户不用手动加线删线。 */
+app.registerExtension({
+  name: "ZWNLOVE.LoadModeLinkGuard",
+  setup() {
+    const install = () => {
+      if (!app || typeof app.graphToPrompt !== "function") return false;
+      if (app.__zwnLinkGuard) return true;
+      const orig = app.graphToPrompt;
+      // graphToPrompt 返回 { workflow, output }，output 就是提交给 /prompt 的图
+      app.graphToPrompt = async function (...args) {
+        // 提交前再收敛一次悬空的「图片」引用：工作流开着的时候 input 目录
+        // 可能被清理，运行前的缺失媒体扫描会拿旧文件名卡运行
+        try {
+          for (const n of app.graph?._nodes || []) {
+            if (n && ZWN_CROP_TYPES.has(n.type)) zwnNormalizePictureWidget(n);
+          }
+        } catch (err) {}
+        const r = await orig.apply(this, args);
+        try {
+          const n = zwnStripLoadModeLinks(r && r.output);
+          if (n) console.log("[ZWNLOVE] 加载模式：提交时摘掉 " + n + " 条「图像输入」连线");
+        } catch (err) {
+          console.warn("[ZWNLOVE] link guard:", err);
+        }
+        return r;
+      };
+      // 手动刷新节点下拉（refreshComboInNode / 右键 refresh）后，选项列表
+      // 按当前 input 目录重建，悬空引用这时候才暴露出来；刷新完再收敛一次
+      if (typeof app.refreshComboInNode === "function" && !app.__zwnComboRefreshGuard) {
+        app.__zwnComboRefreshGuard = true;
+        const origRefresh = app.refreshComboInNode;
+        app.refreshComboInNode = async function (...args) {
+          const r = await origRefresh.apply(this, args);
+          try {
+            for (const n of app.graph?._nodes || []) {
+              if (!n) continue;
+              if (ZWN_CROP_TYPES.has(n.type)) zwnNormalizePictureWidget(n);
+              if (n.type === ZWN_GOOHAI_LOAD_TYPE) zwnScheduleGoohaiStaleCleanup(n, 300);
+            }
+          } catch (err) {}
+          return r;
+        };
+      }
+      app.__zwnLinkGuard = true;
+      return true;
+    };
+    // 只重试一次的话，setup 时 app 还没就绪就永久失效了；多试几轮更稳
+    let tries = 0;
+    const tryInstall = () => {
+      if (install()) return;
+      if (++tries < 20) setTimeout(tryInstall, 500);
+      else console.warn("[ZWNLOVE] graphToPrompt 包装失败：加载模式下连线不会被摘掉");
+    };
+    tryInstall();
+  }
+});
+
+/* ==================================================================
+   孤海「加载图像」节点（LoadImageGoohai）的悬空图片记录清理。
+   遮罩编辑器保存时会把原图/蒙版/输出三张图传进 input/clipspace/，
+   并把输出图路径写进节点 properties（guhaiImageValue 等）和下拉选项
+   列表（纯前端内存）。这些文件被清理后两处都不会跟着同步，重载时
+   孤海还会用 properties 里的旧路径把值「复活」回来，于是下拉里永远
+   挂着一条指向已删除文件的记录。这里在载入/刷新下拉后逐个到后端
+   /view 探测：文件确实不在了，值复位成「无」、选项从列表里摘掉。
+   真实上传的图片和仍然存在的 clipspace 产物一律不碰。
+   ================================================================== */
+const ZWN_GOOHAI_LOAD_TYPE = "LoadImageGoohai";
+// 只针对「过程产物」路径：clipspace 子目录、裁剪缓存、遮罩中间产物
+const ZWN_TRANSIENT_VALUE_RE = /clipspace\/|zwn_crop_|painted-/;
+
+function zwnParseImageValue(v) {
+  const s = String(v ?? "").trim();
+  const m = /^(.*?)\s*\[([^\]]*)\]\s*$/.exec(s);
+  const base = m ? m[1] : s;
+  const type = m && m[2] ? m[2] : "input";
+  const parts = base.split("/");
+  const filename = parts.pop();
+  return { filename, subfolder: parts.join("/"), type };
+}
+
+function zwnFileExistsOnServer(v) {
+  const p = zwnParseImageValue(v);
+  const url = "/view?filename=" + encodeURIComponent(p.filename)
+    + "&type=" + encodeURIComponent(p.type || "input")
+    + "&subfolder=" + encodeURIComponent(p.subfolder || "");
+  return fetch(url).then((r) => {
+    if (r.ok) return true;
+    if (r.status === 404) return false;
+    return null; // 其他状态码当「未知」，宁可不动作
+  }).catch(() => null);
+}
+
+function zwnCleanGoohaiStale(node) {
+  const w = (node.widgets || []).find((x) => x && x.name === "image");
+  if (!w) return;
+  const vals = Array.isArray(w.options && w.options.values) ? w.options.values : null;
+  const targets = [];
+  const cur = String(w.value ?? "");
+  if (cur && cur !== "无" && ZWN_TRANSIENT_VALUE_RE.test(cur)) targets.push(cur);
+  if (vals) {
+    for (const v of vals) {
+      if (typeof v === "string" && v !== "无" && ZWN_TRANSIENT_VALUE_RE.test(v)
+        && !targets.includes(v)) targets.push(v);
+    }
+  }
+  if (!targets.length) return;
+  Promise.all(targets.map((v) => zwnFileExistsOnServer(v).then((ok) => [v, ok])))
+    .then((pairs) => {
+      const gone = pairs.filter(([, ok]) => ok === false).map(([v]) => v);
+      if (!gone.length) return;
+      let changed = false;
+      if (gone.includes(String(w.value ?? ""))) {
+        w.value = "无";
+        if (node.properties) node.properties.guhaiImageValue = "无";
+        changed = true;
+      }
+      if (vals) {
+        const next = vals.filter((v) => !gone.includes(v));
+        if (next.length !== vals.length) {
+          vals.length = 0;
+          vals.push(...next);
+          changed = true;
+        }
+      }
+      if (changed) {
+        node.setDirtyCanvas?.(true, true);
+        app.graph?.change?.();
+        console.log("[ZWNLOVE] 已清理指向已删除文件的图片记录:", gone.join(", "));
+      }
+    });
+}
+
+function zwnScheduleGoohaiStaleCleanup(node, delay) {
+  setTimeout(() => {
+    if (node.graph) {
+      try { zwnCleanGoohaiStale(node); } catch (err) {}
+    }
+  }, delay || 1200);
+}
+
+app.registerExtension({
+  name: "ZWNLOVE.GoohaiStaleCleanup",
+  beforeRegisterNodeDef(nodeType, nodeData) {
+    if (!nodeData || nodeData.name !== ZWN_GOOHAI_LOAD_TYPE) return;
+    const proto = nodeType.prototype;
+    const origConf = proto.onConfigure;
+    const origCreated = proto.onNodeCreated;
+    proto.onConfigure = function () {
+      const r = origConf ? origConf.apply(this, arguments) : undefined;
+      // 孤海自己的 onConfigure 会拿 properties 里的旧路径复活值，
+      // 等它跑完再探测清理，延时排到它后面
+      zwnScheduleGoohaiStaleCleanup(this);
+      return r;
+    };
+    proto.onNodeCreated = function () {
+      const r = origCreated ? origCreated.apply(this, arguments) : undefined;
+      zwnScheduleGoohaiStaleCleanup(this);
+      return r;
+    };
+  },
+});
+
 // SEND_SWITCH_END
